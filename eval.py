@@ -1,6 +1,8 @@
 import os
 from argparse import ArgumentParser
-from pathlib import Path
+import datasets
+from PIL import Image
+
 
 import torch
 from torch.utils.data import DataLoader
@@ -28,27 +30,44 @@ class NoopContext:
         pass
 
 
+def collate_fn(examples):
+    images = torch.stack([example["jpg"] for example in examples])
+    images = images.to(memory_format=torch.contiguous_format).float()
+    labels = torch.tensor([example["cls"] for example in examples])
+    metadatas = [example["json"] for example in examples]
+    return {"images": images, "labels": labels, "metadatas": metadatas}
+
+
 def main(data, name, device, batch_size, num_workers, precision):
-    data = Path(data).expanduser()
-    assert data.exists() and data.is_dir(), f"invalid data path '{data.as_posix()}'"
+    dataset = datasets.load_dataset(data, data_files="*valid*")["train"]
+    # data = Path(data).expanduser()
+    # assert data.exists() and data.is_dir(), f"invalid data path '{data.as_posix()}'"
 
     # init device
     print(f"using device: {device}")
     device = torch.device(device)
 
     # init data
-    print(f"initializing ImageNet-1K validation set '{data.as_posix()}'")
-    dataset = ImageFolder(
-        root=data,
-        transform=Compose(
+    print(f"initializing ImageNet-1K validation set '{data}'")
+    transform_fn = Compose(
             [
                 Resize(size=224, interpolation=InterpolationMode.BICUBIC),
                 CenterCrop(size=224),
                 ToTensor(),
                 Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ],
-        ),
-    )
+        )
+    def img_transform(examples):
+        images = [
+            (image.convert("RGB") if not isinstance(image, str) else Image.open(image).convert("RGB"))
+            for image in examples["jpg"]
+        ]
+        images = [transform_fn(image) for image in images]
+        examples["jpg"] = images
+        return examples
+
+    dataset = dataset.with_transform(img_transform)
+
     if os.name != "nt":
         assert len(dataset) == 50000, f"dataset is not ImageNet-1K validation set (len(dataset) = {len(dataset)})"
 
@@ -72,15 +91,18 @@ def main(data, name, device, batch_size, num_workers, precision):
     dataloader = DataLoader(
         dataset=dataset,
         batch_size=batch_size,
-        num_workers=num_workers,
+        collate_fn=collate_fn,
+        # num_workers=num_workers,
     )
     num_correct = 0
-    for x, y in tqdm(dataloader):
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-        with autocast_ctx:
-            y_hat = model(x).argmax(dim=1)
-        num_correct += (y_hat == y).sum()
+    model = model.eval()
+    with torch.no_grad():
+        for batch in tqdm(dataloader):
+            x = batch["images"].to(device, non_blocking=True)
+            y = batch["labels"].to(device, non_blocking=True)
+            with autocast_ctx:
+                y_hat = model(x).argmax(dim=1)
+            num_correct += (y_hat == y).sum()
     accuracy = num_correct / len(dataset)
     print(f"accuracy: {accuracy * 100:.2f}%")
 
