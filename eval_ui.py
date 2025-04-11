@@ -6,6 +6,7 @@ import gradio as gr
 import requests
 
 import torch
+import itertools
 from torchvision.transforms import Compose, Normalize, Resize, CenterCrop, InterpolationMode, ToTensor
 
 
@@ -56,21 +57,50 @@ def main(data, name, device, batch_size, num_workers, precision):
     model = torch.hub.load("nx-ai/vision-lstm", name)
     model = model.to(device).eval()
 
+    iter_dataset = itertools.cycle(dataset.select(range(100)))
+
     # iterate over dataset
-    def predict(img):
-        img = img_transform(img)
-        x = img.unsqueeze(0).to(device, non_blocking=True, memory_format=torch.contiguous_format).float()
+    def get_next_item():
+        elem = next(iter_dataset)
+
+        img = elem["jpg"].convert("RGB")
+        x = transform_fn(img)
+        x = x.unsqueeze(0).to(device, non_blocking=True, memory_format=torch.contiguous_format).float()
         with torch.no_grad(), torch.autocast(device_type=str(device).split(":")[0], dtype=torch.bfloat16):
             prediction = model(x).softmax(-1)[0]
             confidences = {label_names[i]: float(prediction[i]) for i in range(1000)}
-        return confidences
+        return img, confidences
 
-    demo = gr.Interface(
-        fn=predict,
-        inputs=gr.Image(type="pil"),
-        outputs=gr.Label(num_top_classes=3),
-        examples=dataset.select(range(100))["jpg"],
-    )
+    # Build the Gradio Blocks interface.
+    with gr.Blocks(
+        head="""
+            <script>
+            // Function that triggers the click event on the button
+            function continuouslyClickButton() {
+                const button = document.getElementById("next-button");
+                if (button) {
+                    button.click();
+                } else {
+                    console.warn("Button not found");
+                }
+            }
+
+            // Set the interval (e.g., every 1000 milliseconds)
+            setInterval(continuouslyClickButton, 100);
+            </script>
+            """
+    ) as demo:
+        gr.Markdown(value="## Auto-Updating Image and Prediction Demo")
+
+        # Output components: one for the image and one for the text prediction.
+        image_component = gr.Image(label="Image", type="pil")
+        prediction_component = gr.Label(label="Prediction", num_top_classes=3)
+
+        # A hidden button that triggers the update.
+        next_button = gr.Button("Next", visible=True, elem_id="next-button")
+        next_button.click(fn=get_next_item, inputs=[], outputs=[image_component, prediction_component])
+
+    # Launch the demo.
     demo.launch()
 
 
